@@ -1,72 +1,105 @@
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel
 import edge_tts
 import uuid
 import os
-import asyncio
-from datetime import datetime, timedelta
 
 app = FastAPI()
 
 TMP_DIR = "tmp"
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# =========================
-# VOICE MAP (ngôn ngữ → voice)
-# =========================
-VOICE_MAP = {
-    "vi": {
-        "male": "vi-VN-NamMinhNeural",
-        "female": "vi-VN-HoaiMyNeural"
-    },
-    "en": {
-        "male": "en-US-GuyNeural",
-        "female": "en-US-AriaNeural"
-    },
-    "ja": {
-        "male": "ja-JP-KeitaNeural",
-        "female": "ja-JP-NanamiNeural"
-    },
-    "ko": {
-        "male": "ko-KR-InJoonNeural",
-        "female": "ko-KR-SunHiNeural"
-    }
+# =====================
+# VOICE LIST
+# =====================
+VOICES = {
+    "vi-male": "vi-VN-NamMinhNeural",
+    "vi-female": "vi-VN-HoaiMyNeural",
+    "en-male": "en-US-GuyNeural",
+    "en-female": "en-US-AriaNeural"
 }
 
-# =========================
-# CLEANUP OLD FILES
-# =========================
-def cleanup_files():
-    now = datetime.now()
-    for file in os.listdir(TMP_DIR):
-        path = os.path.join(TMP_DIR, file)
-        if os.path.isfile(path):
-            created = datetime.fromtimestamp(os.path.getctime(path))
-            if now - created > timedelta(hours=24):
-                os.remove(path)
+# =====================
+# MODEL
+# =====================
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "vi-female"
 
-# chạy cleanup mỗi lần gọi API
-@app.middleware("http")
-async def auto_cleanup(request, call_next):
-    cleanup_files()
-    response = await call_next(request)
-    return response
+# =====================
+# CORE GENERATE
+# =====================
+async def generate(text, voice_key):
+    voice = VOICES.get(voice_key, VOICES["vi-female"])
 
-# =========================
-# TTS API
-# =========================
-@app.get("/tts")
-async def tts(
-    text: str,
-    lang: str = "vi",
-    gender: str = "female"
-):
-    file_id = str(uuid.uuid4())
-    file_path = f"{TMP_DIR}/{file_id}.mp3"
-
-    voice = VOICE_MAP.get(lang, VOICE_MAP["vi"])[gender]
+    file_path = f"{TMP_DIR}/{uuid.uuid4()}.mp3"
 
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(file_path)
 
+    return file_path
+
+# =====================
+# GET API
+# =====================
+@app.get("/tts")
+async def tts_get(text: str, voice: str = "vi-female"):
+    file_path = await generate(text, voice)
     return FileResponse(file_path, media_type="audio/mpeg")
+
+# =====================
+# POST API
+# =====================
+@app.post("/tts")
+async def tts_post(req: TTSRequest):
+    file_path = await generate(req.text, req.voice)
+    return FileResponse(file_path, media_type="audio/mpeg")
+
+# =====================
+# WEB UI
+# =====================
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """
+    <html>
+    <head>
+        <title>Edge TTS UI</title>
+    </head>
+    <body style="font-family: Arial; max-width: 600px; margin: auto; padding-top: 50px;">
+        <h2>🎙 Edge TTS Web UI</h2>
+
+        <textarea id="text" style="width:100%;height:100px;">xin chào</textarea>
+
+        <br><br>
+
+        <select id="voice">
+            <option value="vi-female">🇻🇳 Nữ Việt</option>
+            <option value="vi-male">🇻🇳 Nam Việt</option>
+            <option value="en-female">🇺🇸 Nữ Anh</option>
+            <option value="en-male">🇺🇸 Nam Anh</option>
+        </select>
+
+        <br><br>
+
+        <button onclick="speak()">▶ Generate</button>
+
+        <br><br>
+
+        <audio id="audio" controls></audio>
+
+        <script>
+        async function speak() {
+            const text = document.getElementById("text").value;
+            const voice = document.getElementById("voice").value;
+
+            const res = await fetch(`/tts?text=${encodeURIComponent(text)}&voice=${voice}`);
+            const blob = await res.blob();
+
+            const url = URL.createObjectURL(blob);
+            document.getElementById("audio").src = url;
+        }
+        </script>
+    </body>
+    </html>
+    """

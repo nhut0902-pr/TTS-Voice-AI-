@@ -1,105 +1,150 @@
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
-import edge_tts
-import uuid
 import os
+import asyncio
+import hashlib
+from fastapi import FastAPI, Query
+from fastapi.responses import FileResponse, JSONResponse
+import edge_tts
+from edge_tts.exceptions import NoAudioReceived
+from gtts import gTTS
 
-app = FastAPI()
-
-TMP_DIR = "tmp"
-os.makedirs(TMP_DIR, exist_ok=True)
+app = FastAPI(title="Stable TTS API")
 
 # =====================
-# VOICE LIST
+# CONFIG
 # =====================
-VOICES = {
-    "vi-male": "vi-VN-NamMinhNeural",
-    "vi-female": "vi-VN-HoaiMyNeural",
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+queue = asyncio.Queue()
+worker_started = False
+
+VOICE_MAP = {
+    "en-female": "en-US-AriaNeural",
     "en-male": "en-US-GuyNeural",
-    "en-female": "en-US-AriaNeural"
+    "vi-female": "vi-VN-HoaiMyNeural",
+    "vi-male": "vi-VN-NamMinhNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "ko": "ko-KR-SunHiNeural",
 }
 
 # =====================
-# MODEL
+# UTIL
 # =====================
-class TTSRequest(BaseModel):
-    text: str
-    voice: str = "vi-female"
+def clean_text(text: str):
+    if not text:
+        return None
+    text = text.strip()
+    if len(text) < 1:
+        return None
+    return text[:250]
+
+def cache_key(text, voice):
+    return hashlib.md5(f"{text}::{voice}".encode()).hexdigest()
+
+def file_ok(path):
+    return os.path.exists(path) and os.path.getsize(path) > 1000
 
 # =====================
-# CORE GENERATE
+# TTS ENGINES
 # =====================
-async def generate(text, voice_key):
-    voice = VOICES.get(voice_key, VOICES["vi-female"])
-
-    file_path = f"{TMP_DIR}/{uuid.uuid4()}.mp3"
-
+async def edge_tts_run(text, voice, path):
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(file_path)
+    await communicate.save(path)
 
-    return file_path
+def google_tts_run(text, path, lang="vi"):
+    tts = gTTS(text=text, lang=lang)
+    tts.save(path)
+
+async def generate_tts(text, voice, path):
+    last_err = None
+
+    # try EDGE first
+    for _ in range(2):
+        try:
+            await edge_tts_run(text, voice, path)
+            if file_ok(path):
+                return path
+        except NoAudioReceived as e:
+            last_err = e
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.5)
+
+    # fallback GOOGLE
+    try:
+        lang = "vi" if "vi" in voice else "en"
+        google_tts_run(text, path, lang)
+        if file_ok(path):
+            return path
+    except Exception as e:
+        last_err = e
+
+    raise last_err or Exception("TTS FAILED")
 
 # =====================
-# GET API
+# WORKER (QUEUE)
+# =====================
+async def worker():
+    while True:
+        job = await queue.get()
+
+        try:
+            await generate_tts(
+                job["text"],
+                job["voice"],
+                job["path"]
+            )
+        except:
+            # fail silent → tránh 500 chết server
+            open(job["path"], "wb").close()
+
+        queue.task_done()
+
+@app.on_event("startup")
+async def startup():
+    global worker_started
+    if not worker_started:
+        asyncio.create_task(worker())
+        worker_started = True
+
+# =====================
+# API
 # =====================
 @app.get("/tts")
-async def tts_get(text: str, voice: str = "vi-female"):
-    file_path = await generate(text, voice)
-    return FileResponse(file_path, media_type="audio/mpeg")
+async def tts(text: str = Query(...), voice: str = Query("en-female")):
 
-# =====================
-# POST API
-# =====================
-@app.post("/tts")
-async def tts_post(req: TTSRequest):
-    file_path = await generate(req.text, req.voice)
-    return FileResponse(file_path, media_type="audio/mpeg")
+    text = clean_text(text)
+    if not text:
+        return JSONResponse({"error": "empty text"}, status_code=400)
 
-# =====================
-# WEB UI
-# =====================
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return """
-    <html>
-    <head>
-        <title>Edge TTS UI</title>
-    </head>
-    <body style="font-family: Arial; max-width: 600px; margin: auto; padding-top: 50px;">
-        <h2>🎙 Edge TTS Web UI</h2>
+    voice = VOICE_MAP.get(voice, "en-US-AriaNeural")
 
-        <textarea id="text" style="width:100%;height:100px;">xin chào</textarea>
+    key = cache_key(text, voice)
+    path = os.path.join(CACHE_DIR, f"{key}.mp3")
 
-        <br><br>
+    # CACHE HIT
+    if file_ok(path):
+        return FileResponse(path, media_type="audio/mpeg")
 
-        <select id="voice">
-            <option value="vi-female">🇻🇳 Nữ Việt</option>
-            <option value="vi-male">🇻🇳 Nam Việt</option>
-            <option value="en-female">🇺🇸 Nữ Anh</option>
-            <option value="en-male">🇺🇸 Nam Anh</option>
-        </select>
+    # PUSH TO QUEUE
+    await queue.put({
+        "text": text,
+        "voice": voice,
+        "path": path
+    })
 
-        <br><br>
+    # WAIT FOR RESULT (short polling)
+    for _ in range(25):
+        if file_ok(path):
+            return FileResponse(path, media_type="audio/mpeg")
+        await asyncio.sleep(0.2)
 
-        <button onclick="speak()">▶ Generate</button>
-
-        <br><br>
-
-        <audio id="audio" controls></audio>
-
-        <script>
-        async function speak() {
-            const text = document.getElementById("text").value;
-            const voice = document.getElementById("voice").value;
-
-            const res = await fetch(`/tts?text=${encodeURIComponent(text)}&voice=${voice}`);
-            const blob = await res.blob();
-
-            const url = URL.createObjectURL(blob);
-            document.getElementById("audio").src = url;
-        }
-        </script>
-    </body>
-    </html>
-    """
+    # NO 500 EVER
+    return JSONResponse(
+        {
+            "status": "processing",
+            "message": "try again"
+        },
+        status_code=202
+    )
